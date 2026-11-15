@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -235,20 +236,28 @@ func (r *Run) Log(message string, isError bool) {
 
 // WriteOutput uploads this run's output.
 //
-// Also over a presigned URL, and also in both execution modes — a filesystem path
+// The URL is minted at the moment of the write, so a run of any length can
+// write at its end; TOFT_OUTPUT_URI is the fallback. Also over a presigned URL, and also in both execution modes — a filesystem path
 // would work in shared mode and would then make an app written against it unable
 // to move to isolated mode.
 func (r *Run) WriteOutput(ctx context.Context, body []byte) error {
 	if r.OutputURI == "" {
 		return &Error{Body: refusal("no_output", "WriteOutput works inside a job run, which the platform gives an output location; outside one there is nowhere to write"), Message: "this run has no output location"}
 	}
+	target := r.freshOutputURL(ctx)
+	if target == "" {
+		target = r.OutputURI
+	}
 	ctx, cancel := context.WithTimeout(ctx, uploadTimeout)
 	defer cancel()
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, r.OutputURI, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPut, target, bytes.NewReader(body))
 	if err != nil {
 		return &Error{Message: err.Error(), Wrapped: err}
 	}
+	// Azure Blob's Put Blob refuses a request without it; S3 ignores it. Sent
+	// on every output PUT, so the URL alone decides nothing about the backend.
+	req.Header.Set("x-ms-blob-type", "BlockBlob")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return &Error{Message: fmt.Sprintf("uploading output: %v", err), Wrapped: err}
@@ -258,6 +267,33 @@ func (r *Run) WriteOutput(ctx context.Context, body []byte) error {
 		return objectStoreRefusal("output_unwritable", fmt.Sprintf("uploading output: %s", resp.Status), resp.StatusCode)
 	}
 	return nil
+}
+
+// outputURLPath is the route a run mints its output URL at, at the moment it
+// writes. The URL in TOFT_OUTPUT_URI was signed at bootstrap for at most six
+// hours — less where the store signs with a role's temporary credential — so a
+// long run's write at its end found it expired. Asked first; OutputURI is the
+// fallback for a platform that predates the route.
+const outputURLPath = "/api/v1/runner/output-url"
+
+// freshOutputURL returns a just-minted output URL, or "" when the platform did
+// not give one.
+func (r *Run) freshOutputURL(ctx context.Context) string {
+	if r.base == "" || r.token == "" || r.client == nil {
+		return ""
+	}
+	raw, err := r.call(ctx, outputURLPath, map[string]string{"version": runnerContractVersion})
+	if err != nil {
+		return ""
+	}
+	var resp struct {
+		URL string `json:"url"`
+	}
+	if json.Unmarshal(raw, &resp) != nil ||
+		!(strings.HasPrefix(resp.URL, "https://") || strings.HasPrefix(resp.URL, "http://")) {
+		return ""
+	}
+	return resp.URL
 }
 
 // WriteOutputJSON is [Run.WriteOutput] with value encoded as JSON.

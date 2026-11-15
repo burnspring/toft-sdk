@@ -444,7 +444,12 @@ export class JobRun {
     return raw?.lines ?? [];
   }
 
-  /** Async-iterate log lines until the run reaches a terminal status. */
+  /**
+   * Async-iterate log lines until the run reaches a terminal status.
+   *
+   * `logs(afterSeq)` is one page of at most a thousand lines; this reads every
+   * page, so it is the way to get a whole log.
+   */
   async *tail(options) {
     const { pollIntervalMs = 2000 } = takeOptions("tail()", options, ["pollIntervalMs"],
       "for await (const line of run.tail({ pollIntervalMs: 2000 }))");
@@ -470,13 +475,22 @@ export class JobRun {
         yield line;
       }
       if (done) {
-        // One last read: lines can land between the poll and the status check,
-        // and losing the end of a failing job's output loses the part that
-        // explains it.
-        for (const line of await this.logs(seq)) yield line;
-        return;
+        // Read to the end: lines can land between the poll and the status
+        // check, and the route answers a thousand lines a page with no "more"
+        // marker, so one last read of one page lost the end of a long failing
+        // job's output — the part that explains it (code review 2026-11-11,
+        // I-1).
+        for (;;) {
+          const rest = await this.logs(seq);
+          if (rest.length === 0) return;
+          for (const line of rest) {
+            seq = Math.max(seq, line.seq ?? seq);
+            yield line;
+          }
+        }
       }
-      await sleep(pollIntervalMs);
+      // A full page means more is already there: read on without waiting.
+      if (lines.length < 1000) await sleep(pollIntervalMs);
     }
   }
 

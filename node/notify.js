@@ -132,16 +132,25 @@ class Part {
     if (Array.isArray(value) && value.length === 2) {
       return new Part(field, value[0], toBytes(value[1]));
     }
-    if (value && typeof value === "object") {
-      return new Part(
-        field,
-        value.name ?? "attachment",
-        toBytes(value.content ?? new Uint8Array()),
-        value.type ?? "",
-      );
+    // Bytes on their own are the content, under a name the platform will
+    // keep ("attachment", or a File's own). They used to fall into the object
+    // branch below with no `.content`, and went out as a zero-byte file
+    // named attachment, accepted and delivered (code review 2026-11-11, I-3).
+    if (value instanceof Uint8Array || value instanceof ArrayBuffer) {
+      return new Part(field, "attachment", toBytes(value));
     }
-    throw refusal("bad_request", "an attachment must be a path, a [name, bytes] pair, or {name, content}",
-      { hint: 'pass "/tmp/report.csv", ["report.csv", bytes] or { name, content }' });
+    if (typeof Blob !== "undefined" && value instanceof Blob) {
+      return new Part(field, value.name ?? "attachment", new Uint8Array(await value.arrayBuffer()), value.type ?? "");
+    }
+    if (value && typeof value === "object") {
+      if (value.content === undefined || value.content === null) {
+        throw refusal("bad_request", "an attachment object needs `content`: the bytes or string to send",
+          { hint: 'pass { name: "report.csv", content: bytes }, or the bytes alone' });
+      }
+      return new Part(field, value.name ?? "attachment", toBytes(value.content), value.type ?? "");
+    }
+    throw refusal("bad_request", "an attachment must be a path, bytes, a [name, bytes] pair, or {name, content}",
+      { hint: 'pass "/tmp/report.csv", bytes, ["report.csv", bytes] or { name, content }' });
   }
 }
 

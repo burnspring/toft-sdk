@@ -48,6 +48,9 @@ type signedRequest struct {
 	URL     string            `json:"url"`
 	Method  string            `json:"method"`
 	Headers map[string]string `json:"headers"`
+	// ExistsStatus is the status the store answers a create-only upload of a
+	// name that exists with (I-5); 0 from an install that does not say.
+	ExistsStatus int `json:"exists_status"`
 }
 
 // List reads one page of what is under path ("" for the top).
@@ -122,7 +125,15 @@ func (m Mount) Upload(ctx context.Context, source, name string) (string, error) 
 	}
 	if _, err := sendSignedReader(ctx, signed, io.LimitReader(f, size), size); err != nil {
 		var e *Error
-		if errors.As(err, &e) && e.Status == http.StatusPreconditionFailed {
+		// The status the store answers an existing name with is the signer's
+		// to say — 412 where If-None-Match is signed, 403 on an Azure
+		// create-only SAS (code review 2026-11-11, I-5); 412 when an older
+		// install says nothing.
+		exists := signed.ExistsStatus
+		if exists == 0 {
+			exists = http.StatusPreconditionFailed
+		}
+		if errors.As(err, &e) && e.Status == exists {
 			// `write`, not m.Access: the store signs at the mapping's level
 			// *now*, and only `write` is refused an existing name — the cached
 			// level was the one the app started with.

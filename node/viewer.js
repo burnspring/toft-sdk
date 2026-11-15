@@ -159,6 +159,11 @@ export async function who(headers, options) {
   const { refresh = false } = takeOptions("who()", options, ["refresh"], "toft.who(req.headers, { refresh: true })");
   const blob = findHeader(headers, ACT_FOR_HEADER);
   if (!blob) return null;
+  // The verified role header already says when nobody is signed in, and the
+  // gateway mints a stranger's blob afresh on every request, so asking the
+  // platform here missed the cache every time and spent the app's own rate
+  // bucket on anonymous page views (code review 2026-11-11, I-4).
+  if (caller(headers).role === ROLE_ANONYMOUS) return null;
   return resolveIdentity(blob, refresh);
 }
 

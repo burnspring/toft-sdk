@@ -466,20 +466,29 @@ func (r JobRun) Logs(ctx context.Context, after int) ([]LogLine, error) {
 // second way to stop it, and the caller already has a context.
 func (r JobRun) Tail(ctx context.Context, visit func(LogLine) bool) error {
 	seq := 0
+	// drain reads pages until one comes back empty. The route answers at most
+	// a page per request with no "more" marker, so one read per poll left a
+	// chatty run's log behind — and one read after the run ended dropped its
+	// end, which is where a failure explains itself.
 	drain := func() (bool, error) {
-		lines, err := r.Logs(ctx, seq)
-		if err != nil {
-			return false, err
-		}
-		for _, line := range lines {
-			if line.Seq > seq {
-				seq = line.Seq
+		for {
+			lines, err := r.Logs(ctx, seq)
+			if err != nil {
+				return false, err
 			}
-			if !visit(line) {
-				return false, nil
+			before := seq
+			for _, line := range lines {
+				if line.Seq > seq {
+					seq = line.Seq
+				}
+				if !visit(line) {
+					return false, nil
+				}
+			}
+			if len(lines) == 0 || seq == before {
+				return true, nil
 			}
 		}
-		return true, nil
 	}
 	for {
 		keep, err := drain()

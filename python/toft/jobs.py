@@ -519,7 +519,10 @@ class JobRun:
     # --- Logs ---
 
     def logs(self, after_seq: int = 0) -> list[dict]:
-        """Log lines after ``after_seq``: ``{seq, at, stream, line}`` each."""
+        """One page of log lines after ``after_seq``: ``{seq, at, stream, line}`` each.
+
+        A page is at most a thousand lines; ``tail()`` reads every page.
+        """
         # A whole number from 0, as Node and Go hold it: -1 reached the
         # platform, and int("x") was an uncoded ValueError (BB-025).
         if isinstance(after_seq, bool) or not isinstance(after_seq, int) or after_seq < 0:
@@ -557,13 +560,21 @@ class JobRun:
                 seq = max(seq, int(line.get("seq") or seq))
                 yield line
             if done:
-                # One last read: lines can land between the poll and the status
-                # check, and losing the end of a failing job's output loses the
-                # part that explains it.
-                for line in self.logs(after_seq=seq):
-                    yield line
-                return
-            time.sleep(poll_interval)
+                # Read to the end: lines can land between the poll and the
+                # status check, and the route answers a thousand lines a page
+                # with no "more" marker, so one last read of one page lost the
+                # end of a long failing job's output — the part that explains
+                # it (code review 2026-11-11, I-1).
+                while True:
+                    rest = self.logs(after_seq=seq)
+                    if not rest:
+                        return
+                    for line in rest:
+                        seq = max(seq, int(line.get("seq") or seq))
+                        yield line
+            # A full page means more is already there: read on without waiting.
+            if len(lines) < 1000:
+                time.sleep(poll_interval)
 
     def cancel(self) -> None:
         """Stop this run.

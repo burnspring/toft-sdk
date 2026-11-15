@@ -314,7 +314,12 @@ class AppTransport:
         # made one at a time but refused a concurrent burst: every refused call
         # came back at the same instant, one token was free, and the rest were
         # raised (TOFT-BB-002).
-        deadline = time.monotonic() + timeout
+        # The waiting is bounded by the ordinary call bound whatever the
+        # attempt's own timeout: an upload's 300 s let a queue_full 429 — a
+        # handler's answer, after the body was parsed — be waited out and the
+        # attachment re-uploaded some fifty times inside one web request
+        # (code review 2026-11-11, J-4).
+        deadline = time.monotonic() + min(timeout, DEFAULT_TIMEOUT)
         try:
             return self._once(method, path, data, content_type, headers, timeout)
         except ToftError as exc:
@@ -366,10 +371,17 @@ class AppTransport:
             # request; nothing reached a handler — unless it timed out, which
             # spends the call's bound whichever side it happened on.
             timed_out = isinstance(exc.reason, (TimeoutError, socket.timeout))
+            # A pipe broken or reset while the body was still being sent is
+            # the server closing on a request it has read enough of to
+            # refuse — a 413 on an oversized upload — so the request was on
+            # the wire and is not resent (code review 2026-11-11, J-3).
+            cut_off = isinstance(exc.reason, (BrokenPipeError, ConnectionResetError))
             raise _transport_error(
                 f"Toft at {self._base} did not answer within {timeout:g}s" if timed_out
+                else f"Toft at {self._base} closed the connection before the request was fully sent "
+                     f"— usually a body over the size it accepts: {exc.reason}" if cut_off
                 else f"cannot reach Toft at {self._base}: {exc.reason}",
-                sent=timed_out, timed_out=timed_out) from None
+                sent=timed_out or cut_off, timed_out=timed_out, cut_off=cut_off) from None
         except (TimeoutError, socket.timeout):
             raise _transport_error(f"Toft at {self._base} did not answer within {timeout:g}s",
                                    sent=True, timed_out=True) from None
@@ -385,12 +397,20 @@ class AppTransport:
             raise _not_toft(self._base, status, html or payload.lstrip().startswith(b"<")) from None
 
 
-def _transport_error(message: str, *, sent: bool, timed_out: bool = False) -> ToftError:
+def _transport_error(message: str, *, sent: bool, timed_out: bool = False,
+                     cut_off: bool = False) -> ToftError:
     """A request that got no answer: uncoded and retryable, with what the
-    resend rule needs to know about how far it got."""
-    err = ToftError(message)
+    resend rule needs to know about how far it got.
+
+    A body cut off mid-send is the exception: the server stopped reading
+    because it will not take it, so the same body would be refused again.
+    It is neither resent -- even under an Idempotency-Key, which every send
+    carries by default -- nor reported retryable (code review 2026-11-11,
+    J-3, as the e2e case found it)."""
+    err = ToftError(message, body={"retryable": False} if cut_off else None)
     err._sent = sent
     err._timed_out = timed_out
+    err._cut_off = cut_off
     return err
 
 
@@ -409,7 +429,8 @@ def _resendable(method: str, headers: Mapping[str, str], exc: ToftError) -> bool
     """
     idempotent = method == "GET" or bool(headers.get("Idempotency-Key"))
     if exc.status is None:
-        if exc.code or getattr(exc, "_timed_out", False) or not hasattr(exc, "_sent"):
+        if (exc.code or getattr(exc, "_timed_out", False) or getattr(exc, "_cut_off", False)
+                or not hasattr(exc, "_sent")):
             return False
         return not exc._sent or idempotent
     if not exc._auto_retry:

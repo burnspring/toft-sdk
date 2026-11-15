@@ -115,7 +115,7 @@ check_mount_entry <- function(entry) {
     if (!is.character(value) || length(value) != 1 || is.na(value) || !nzchar(value)) {
       stop(toft_refusal("storage_env_invalid", sprintf(
         "a %s entry has no %s: %s", ENV_STORAGE, key,
-        as.character(jsonlite::toJSON(entry, auto_unbox = TRUE, null = "null"))),
+        as.character(jsonlite::toJSON(entry, auto_unbox = TRUE, null = "null", digits = NA))),
         hint = STORAGE_ENV_HINT))
     }
   }
@@ -129,7 +129,7 @@ check_mount_entry <- function(entry) {
       stop(toft_refusal("storage_env_invalid", sprintf(
         "a %s entry's %s is '%s', not one of %s: %s", ENV_STORAGE, key, entry[[key]],
         paste(rule[[2]], collapse = ", "),
-        as.character(jsonlite::toJSON(entry, auto_unbox = TRUE, null = "null"))),
+        as.character(jsonlite::toJSON(entry, auto_unbox = TRUE, null = "null", digits = NA))),
         hint = STORAGE_ENV_HINT))
     }
   }
@@ -391,23 +391,33 @@ store_upload <- function(mount, source, name = NULL) {
   check_local_file(source, "store_upload()", "store_upload(s, \"report.csv\")")
   target <- if (is.null(name) || identical(name, "")) basename(source) else name
   check_relative_name(target, "store_upload")
-  data <- readBin(source, "raw", n = file.info(source)$size)
+  # Streamed, never held: hashed from a connection and sent through curl's
+  # read callback with the length declared. One readBin of the whole file held
+  # it in memory twice over — an app under a memory limit could not upload
+  # anything larger than that limit, and a raw vector past 2^31-1 bytes is a
+  # long vector curl's postfields was never shown to take (security review
+  # 2026-11-14, CS-11 and CS-U1).
+  size <- file.info(source)$size
   signed <- store_request("POST", store_route(mount, "/api/v1/app/store/{slug}/objects"),
-                         body = list(name = target, size = length(data),
+                         body = list(name = target, size = size,
                                      # paste0: a plain string, not the "hash"
                                      # class jsonlite has no method for.
-                                     sha256 = paste0(as.character(openssl::sha256(data)), collapse = ""),
-                                     md5 = paste0(as.character(openssl::md5(data)), collapse = "")),
+                                     sha256 = file_digest(source, openssl::sha256),
+                                     md5 = file_digest(source, openssl::md5)),
                          query = store_query(mount))
-  status <- send_signed(signed, data)
-  if (status == 412) {
+  status <- send_signed(signed, NULL, upload = list(path = source, size = size))
+  # The status the store answers an existing name with is the signer's to say:
+  # 412 where If-None-Match is signed, 403 on an Azure create-only SAS (code
+  # review 2026-11-11, I-5); 412 when an older install says nothing.
+  exists_status <- if (is.null(signed$exists_status)) 412L else as.integer(signed$exists_status)
+  if (status == exists_status) {
     # `write`, not mount$access: the store signs at the mapping's level now,
     # and only `write` is refused an existing name.
     e <- toft_refusal("already_exists", sprintf("'%s' already exists in '%s', and this app's access there is `write`, which creates new objects only",
                  target, mount$name),
       hint = "upload under a new name, or ask an administrator for `full` access where the store is mapped")
     # The store answered, so the status is its own, as not_found's is.
-    e$status <- 412L
+    e$status <- as.integer(status)
     stop(e)
   }
   check_signed_status(status)
@@ -481,7 +491,7 @@ store_url <- function(mount, name, attachment = FALSE) {
 store_link <- function(mount, name) {
   mount <- as_store(mount, "store_link()")
   check_relative_name(name, "store_link")
-  route <- sub("{slug}", utils::URLencode(mount$name, reserved = TRUE),
+  route <- sub("{slug}", url_escape(mount$name),
                "/api/v1/app/store/{slug}/link/{name}", fixed = TRUE)
   route <- sub("{name}", encode_name(name), route, fixed = TRUE)
   answer <- store_request("GET", route, query = store_query(mount))
@@ -560,7 +570,7 @@ store_route <- function(mount, route, name = "") {
                         "is reached over signed URLs"), mount$name, mount$kind),
       hint = sprintf("use storage('%s')$path with the ordinary file functions", mount$name)))
   }
-  route <- sub("{slug}", utils::URLencode(mount$name, reserved = TRUE), route, fixed = TRUE)
+  route <- sub("{slug}", url_escape(mount$name), route, fixed = TRUE)
   sub("{name}", encode_name(name), route, fixed = TRUE)
 }
 
@@ -576,12 +586,23 @@ store_query <- function(mount, extra = list()) {
 
 encode_name <- function(name) {
   parts <- strsplit(name, "/", fixed = TRUE)[[1]]
-  paste(vapply(parts, utils::URLencode, "", reserved = TRUE), collapse = "/")
+  paste(vapply(parts, url_escape, ""), collapse = "/")
+}
+
+# A file's digest, read from a connection rather than from a vector holding
+# the whole file (store_upload).
+file_digest <- function(path, algo) {
+  con <- file(path, "rb")
+  on.exit(close(con))
+  paste0(as.character(algo(con)), collapse = "")
 }
 
 # Carry out a signed request against the object store: the signed headers
 # verbatim, and no Toft header at all — the URL is the whole authorization.
-send_signed <- function(signed, data, keep = FALSE) {
+# `upload`, list(path, size), sends that file as the body through curl's read
+# callback with its length declared — never chunked, because the signed PUT
+# carries the size, and never more than `size` bytes.
+send_signed <- function(signed, data, keep = FALSE, upload = NULL) {
   if (is.null(signed) || is.null(signed$url) || !nzchar(signed$url)) {
     # Not the caller's mistake: an answer the platform should not have given.
     # Uncoded and retryable, as the other three SDKs' statusless error is.
@@ -592,6 +613,18 @@ send_signed <- function(signed, data, keep = FALSE) {
   curl::handle_setopt(handle, customrequest = method)
   if (!is.null(data)) {
     curl::handle_setopt(handle, post = TRUE, postfieldsize = length(data), postfields = data)
+  }
+  if (!is.null(upload)) {
+    con <- file(upload$path, "rb")
+    on.exit(close(con), add = TRUE)
+    left <- upload$size
+    curl::handle_setopt(handle, upload = TRUE, infilesize_large = upload$size,
+      readfunction = function(n) {
+        if (left <= 0) return(raw(0))
+        chunk <- readBin(con, "raw", n = min(n, left))
+        left <<- left - length(chunk)
+        chunk
+      })
   }
   headers <- signed$headers
   if (length(headers)) {

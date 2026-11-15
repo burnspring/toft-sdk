@@ -41,7 +41,7 @@ access_token <- function(kind) {
       as.numeric(cached$expires_at) - as.numeric(Sys.time()) > TOKEN_REFRESH_MARGIN) {
     return(cached)
   }
-  resp <- toft_request("POST", paste0("/api/v1/app/tokens/", utils::URLencode(kind, reserved = TRUE)),
+  resp <- toft_request("POST", paste0("/api/v1/app/tokens/", url_escape(kind)),
                        body = stats::setNames(list(), character(0)))
   folder <- if (is.null(resp$folder)) list() else resp$folder
   token <- structure(list(

@@ -19,6 +19,10 @@
  * precisely the thing that starts the same job twice.
  */
 
+import { createReadStream } from "node:fs";
+import http from "node:http";
+import https from "node:https";
+
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_RETRY_AFTER_MS = 2_000;
 // Added to each wait on a 429, so a burst of refused calls does not come back
@@ -48,6 +52,56 @@ export async function fetchStore(url, init = {}) {
     }
     throw err;
   }
+}
+
+/**
+ * A signed PUT of a local file, streamed from disk with its length declared.
+ *
+ * `fetch` with a stream body sends it chunked, and the signed request carries
+ * the size, so this is `node:http(s)` with `Content-Length` set and the file
+ * piped in — never the whole file in memory: an app under a memory limit could
+ * not otherwise upload anything larger than that limit (security review
+ * 2026-11-14, CS-11). `fs.openAsBlob` would do it through `fetch`, but the
+ * package supports Node 18. The same five-minute bound as `fetchStore`;
+ * resolves `{status, statusText}` and rejects with the plain error, so the
+ * caller keeps its own sentence.
+ */
+export function putStoreFile(url, { method = "PUT", headers = {} } = {}, file, size) {
+  return new Promise((resolve, reject) => {
+    const target = new URL(url);
+    const lib = target.protocol === "https:" ? https : http;
+    let settled = false;
+    const settle = (fn, value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      fn(value);
+    };
+    const req = lib.request(target, { method, headers: { ...headers, "Content-Length": String(size) } }, (resp) => {
+      resp.resume();
+      resp.on("end", () => settle(resolve, { status: resp.statusCode, statusText: resp.statusMessage || "" }));
+      resp.on("error", (err) => settle(reject, err));
+    });
+    const timer = setTimeout(() => {
+      const err = new ToftError(`the object store did not finish within ${UPLOAD_TIMEOUT_MS}ms`);
+      req.destroy(err);
+      settle(reject, err);
+    }, UPLOAD_TIMEOUT_MS);
+    req.on("error", (err) => settle(reject, err));
+    if (size === 0) {
+      req.end();
+      return;
+    }
+    // No further than the size that was hashed and signed: a file still being
+    // written is a short or long body the store refuses, never bytes the
+    // digests did not cover.
+    const stream = createReadStream(file, { start: 0, end: size - 1 });
+    stream.on("error", (err) => {
+      req.destroy(err);
+      settle(reject, err);
+    });
+    stream.pipe(req);
+  });
 }
 
 /**

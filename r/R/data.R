@@ -47,7 +47,7 @@ app_data_set <- function(value, if_version = NULL) {
   resp <- toft_request("PUT", "/api/v1/app/data", body = value, extra_headers = if_match(if_version))
   # The platform's answer is metadata only. The document comes back as a read
   # would decode it — through JSON — so a write and the read after it agree.
-  written <- jsonlite::fromJSON(jsonlite::toJSON(value, auto_unbox = TRUE, null = "null"),
+  written <- jsonlite::fromJSON(jsonlite::toJSON(value, auto_unbox = TRUE, null = "null", digits = NA),
                                 simplifyVector = FALSE)
   if (length(written) == 0) written <- stats::setNames(list(), character(0))
   version <- if (is.null(resp$version)) NA_integer_ else as.integer(resp$version)

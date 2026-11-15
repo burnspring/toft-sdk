@@ -138,6 +138,30 @@ def _run_output_uri(run: "Run") -> str:
     return _SECRETS[run].output_uri
 
 
+# The route a run mints its output URL at, at the moment it writes. The URL
+# in TOFT_OUTPUT_URI was signed at bootstrap for at most six hours — less
+# where the store signs with a role's temporary credential — so a long run's
+# write at its end found it expired. Asked first; TOFT_OUTPUT_URI is the
+# fallback for a platform that predates the route.
+_OUTPUT_URL_PATH = "/api/v1/runner/output-url"
+
+# Azure Blob's Put Blob refuses a request without it; S3 ignores it. Sent on
+# every output PUT, so the URL alone decides nothing about the backend.
+_OUTPUT_HEADERS = {"x-ms-blob-type": "BlockBlob"}
+
+
+def _fresh_output_url(run: "Run") -> str:
+    """A just-minted output URL, or "" when the platform did not give one."""
+    if not run._base_url or not _SECRETS[run].token:
+        return ""
+    try:
+        resp = _run_transport(run).request("POST", _OUTPUT_URL_PATH, {"version": RUNNER_CONTRACT_VERSION})
+    except Exception:  # noqa: BLE001 — any failure falls back to TOFT_OUTPUT_URI
+        return ""
+    url = resp.get("url") if isinstance(resp, dict) else None
+    return url if isinstance(url, str) and url.startswith(("https://", "http://")) else ""
+
+
 class Run:
     """The job's own view of itself: who started it, its params, its deadline;
     report progress, log, write output.
@@ -270,7 +294,9 @@ class Run:
     def write_output(self, data: bytes | str) -> None:
         """Upload this run's output.
 
-        Also a presigned URL, and also in both execution modes — a filesystem
+        The URL is minted at the moment of the write, so a run of any length
+        can write at its end; ``TOFT_OUTPUT_URI`` is the fallback. Also a
+        presigned URL, and also in both execution modes — a filesystem
         path would work in shared mode and would then make an app written
         against it unable to move to isolated mode.
         """
@@ -284,7 +310,8 @@ class Run:
                 f"write_output takes bytes or text, got {type(data).__name__}",
                 hint="use write_output_json(value) for anything else")
         body = data.encode() if isinstance(data, str) else bytes(data)
-        req = urllib.request.Request(output_uri, data=body, method="PUT")
+        output_uri = _fresh_output_url(self) or output_uri
+        req = urllib.request.Request(output_uri, data=body, method="PUT", headers=dict(_OUTPUT_HEADERS))
         try:
             with urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT):
                 return

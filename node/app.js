@@ -22,11 +22,12 @@
  */
 
 import { createHash } from "node:crypto";
+import { createReadStream } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { inspect } from "node:util";
 
-import { ToftError, fetchStore, noMoreArgs, fileRefusal, onPlatform, require_, storeRefusal, takeOptions, transport } from "./transport.js";
+import { ToftError, fetchStore, noMoreArgs, fileRefusal, onPlatform, putStoreFile, require_, storeRefusal, takeOptions, transport } from "./transport.js";
 
 const ENV_STORAGE = "TOFT_STORAGE";
 const ENV_BASE_PATH = "BASE_PATH";
@@ -386,22 +387,36 @@ export class Mount {
     if (name != null && typeof name !== "string") checkRelativeName(name, "upload");
     const target = name || path.basename(source);
     checkRelativeName(target, "upload");
-    let data;
+    // Streamed, never held: both digests in one pass over the file, then the
+    // file piped to the store with its length declared (security review
+    // 2026-11-14, CS-11). The size is what was hashed, so the digests and the
+    // declared length describe the same bytes.
+    let size = 0;
+    const sha = createHash("sha256");
+    const md5 = createHash("md5");
     try {
-      data = await fs.readFile(source);
+      for await (const chunk of createReadStream(source)) {
+        sha.update(chunk);
+        md5.update(chunk);
+        size += chunk.length;
+      }
     } catch (err) {
       throw fileRefusal(err, source);
     }
     const signed = await transport().postJson(this.#route("/api/v1/app/store/{slug}/objects"), {
       name: target,
-      size: data.length,
-      sha256: createHash("sha256").update(data).digest("hex"),
-      md5: createHash("md5").update(data).digest("hex"),
+      size,
+      sha256: sha.digest("hex"),
+      md5: md5.digest("hex"),
     });
     try {
-      await sendSigned(signed, data);
+      await sendSignedFile(signed, source, size);
     } catch (err) {
-      if (err instanceof ToftError && err.status === 412) {
+      // The status the store answers an existing name with is the signer's to
+      // say: 412 where If-None-Match is signed, 403 on an Azure create-only
+      // SAS (code review 2026-11-11, I-5). 412 when an older install says
+      // nothing.
+      if (err instanceof ToftError && err.status === (signed.exists_status || 412)) {
         throw refused("already_exists",
           // `write`, not this.access: the store signs at the mapping's level
           // *now*, and only `write` is refused an existing name — the cached
@@ -548,6 +563,22 @@ function encodeName(name) {
  * Carry out a signed request against the object store: the signed headers
  * verbatim, and no Toft header at all — the URL is the whole authorization.
  */
+/** sendSigned for a local file, streamed (putStoreFile). */
+async function sendSignedFile(signed, file, size) {
+  if (!signed?.url) throw new ToftError("the platform returned no signed URL");
+  let resp;
+  try {
+    resp = await putStoreFile(signed.url, { method: signed.method || "PUT", headers: signed.headers ?? {} }, file, size);
+  } catch (err) {
+    if (err instanceof ToftError) throw err;
+    throw new ToftError(`cannot reach the object store: ${err.message}`);
+  }
+  if (resp.status < 200 || resp.status >= 300) {
+    throw storeRefusal("store_refused", `the object store refused the request: ${resp.status} ${resp.statusText}`,
+      resp.status);
+  }
+}
+
 async function sendSigned(signed, body) {
   if (!signed?.url) throw new ToftError("the platform returned no signed URL");
   let resp;

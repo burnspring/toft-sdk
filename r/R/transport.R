@@ -91,7 +91,27 @@ encode_json <- function(value, what = "the request body") {
       "string in the number's place"), what),
       hint = "replace NaN and Inf with NULL or a number before sending"))
   }
-  jsonlite::toJSON(value, auto_unbox = TRUE, null = "null")
+  # digits = NA is full precision (15 significant digits, R's own). jsonlite's
+  # default is four decimal places,
+  # which rewrote 0.00001234 as 0 and 52.520008 as 52.52 in every document,
+  # parameter set and output this SDK sent — with no error, which is exactly
+  # what the check above exists to prevent (code review 2026-11-11, J-1).
+  jsonlite::toJSON(value, auto_unbox = TRUE, null = "null", digits = NA)
+}
+
+# url_escape percent-encodes one path segment or query value, every reserved
+# character, every time. utils::URLencode's default (repeated = FALSE) returns
+# a string that already contains a %HH sequence *unchanged* — spaces, `#`, `?`
+# and `+` beside it included — so an object literally named "Q1%20report.csv"
+# addressed a different object than the one stored (code review 2026-11-11,
+# J-2). Python's quote() and Node's encodeURIComponent always encode; so does
+# this.
+url_escape <- function(x) {
+  # A number as digits: as.character(1e5) is "1e+05", which the platform's
+  # Atoi read as 0, so a log-paging loop restarted from the top at after = 100000
+  # (code review 2026-11-11, J-5).
+  if (is.numeric(x)) x <- format(x, scientific = FALSE, trim = TRUE)
+  utils::URLencode(as.character(x), reserved = TRUE, repeated = TRUE)
 }
 
 toft_request <- function(method, path, body = NULL, query = NULL, extra_headers = NULL,
@@ -103,8 +123,8 @@ toft_request <- function(method, path, body = NULL, query = NULL, extra_headers 
   url <- paste0(api_url(), path)
   if (!is.null(query) && length(query)) {
     parts <- vapply(names(query), function(k) {
-      paste0(utils::URLencode(k, reserved = TRUE), "=",
-             utils::URLencode(as.character(query[[k]]), reserved = TRUE))
+      paste0(url_escape(k), "=",
+             url_escape(query[[k]]))
     }, character(1))
     url <- paste0(url, "?", paste(parts, collapse = "&"))
   }

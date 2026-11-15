@@ -220,7 +220,7 @@ job_start <- function(job, ..., params = NULL, idempotency_key = NULL) {
   if (!is.null(idempotency_key)) headers[["Idempotency-Key"]] <- idempotency_key
   resp <- toft_request(
     "POST",
-    paste0("/api/v1/app/jobs/", utils::URLencode(job, reserved = TRUE), "/runs"),
+    paste0("/api/v1/app/jobs/", url_escape(job), "/runs"),
     body = body,
     extra_headers = headers
   )
@@ -279,7 +279,7 @@ job_respond <- function(run, res = NULL, req = NULL) {
     attributes(fields) <- list(names = names(fields))
     # `done` is the SDK's reading of the status, not a field of the run.
     fields$done <- NULL
-    body <- as.character(jsonlite::toJSON(fields, auto_unbox = TRUE, null = "null"))
+    body <- as.character(jsonlite::toJSON(fields, auto_unbox = TRUE, null = "null", digits = NA))
   }
 
   # A plumber response is an R6 object with setHeader; filled in and returned,
@@ -314,7 +314,7 @@ read_run <- function(id, act_for = NULL, request_deadline = NULL) {
     headers <- list()
     headers[[ACT_FOR_HEADER]] <- act_for
   }
-  resp <- toft_request("GET", paste0("/api/v1/app/job-runs/", utils::URLencode(id, reserved = TRUE)),
+  resp <- toft_request("GET", paste0("/api/v1/app/job-runs/", url_escape(id)),
                        extra_headers = headers)
   as_run(resp, act_for = act_for, request_deadline = request_deadline)
 }
@@ -366,10 +366,19 @@ list_runs <- function(job = NULL, status = NULL, limit = 50, scope = NULL, viewe
   # Checked here, bad_request, because the platform filters on whatever it is
   # given: a typo'd status answered an empty list that read exactly like
   # "nothing has succeeded", and limit = -1 went through as asked.
-  if (!is.numeric(limit) || length(limit) != 1 || is.na(limit) || limit < 0 || limit != round(limit)) {
+  # 1 to 200, as Python holds it: the platform answered a limit above 200 with
+  # its default of 50, so asking for more returned fewer (code review
+  # 2026-11-11, J-7).
+  if (!is.numeric(limit) || length(limit) != 1 || is.na(limit) || limit < 1 || limit > 200 || limit != round(limit)) {
     stop(toft_refusal("bad_request", sprintf(
-      "limit is how many runs to return, a whole number 0 or more — got %s", deparse(limit)),
-      hint = "pass a whole number, or leave limit at its default of 50"))
+      "limit is how many runs to return, a whole number from 1 to 200 — got %s", deparse(limit)),
+      hint = "pass a whole number up to 200, or leave limit at its default of 50"))
+  }
+  # And a job name, when given, names one: "" went out as job= and the
+  # platform read it as no filter (J-7).
+  if (!is.null(job) && (!is.character(job) || length(job) != 1 || is.na(job) || !nzchar(job))) {
+    stop(toft_refusal("bad_request", "job is the name of one job, or NULL for every job",
+      hint = "pass the job's name as it appears in toft.toml, or leave job NULL"))
   }
   if (!is.null(status) && (!is.character(status) || length(status) != 1 || !(status %in% RUN_STATUSES))) {
     stop(toft_refusal("bad_request", sprintf(
@@ -502,7 +511,7 @@ job_logs <- function(run, after_seq = 0) {
       "job_logs()'s after_seq is the seq to read after, a whole number from 0 - got %s", deparse(after_seq)),
       hint = "job_logs(run, 0) for the first lines, then the last line's seq"))
   }
-  resp <- toft_request("GET", paste0("/api/v1/app/job-runs/", utils::URLencode(run$id, reserved = TRUE), "/logs"),
+  resp <- toft_request("GET", paste0("/api/v1/app/job-runs/", url_escape(run$id), "/logs"),
                        query = list(after = after_seq), extra_headers = run_headers(run))
   lines <- if (is.null(resp$lines)) list() else resp$lines
   pick <- function(field, empty) {
@@ -525,11 +534,14 @@ job_logs <- function(run, after_seq = 0) {
 #' @export
 job_output <- function(run, json = FALSE) {
   check_run(run, "job_output")
-  path <- paste0("/api/v1/app/job-runs/", utils::URLencode(run$id, reserved = TRUE), "/output")
+  path <- paste0("/api/v1/app/job-runs/", url_escape(run$id), "/output")
   resp <- tryCatch(
     toft_request("GET", path, extra_headers = run_headers(run), parse = FALSE),
     toft_error = function(e) {
-      if (identical(e$status, 404L) || identical(e$status, 404)) NULL else stop(e)
+      # Only "this run wrote nothing" is NULL. The same route answers 404
+      # not_found for a run that was trimmed or is somebody else's, which
+      # read as a run with no output (code review 2026-11-11, J-6).
+      if (identical(e$code, "no_output")) NULL else stop(e)
     }
   )
   if (is.null(resp)) {
@@ -583,7 +595,7 @@ job_output <- function(run, json = FALSE) {
 #' @export
 job_cancel <- function(run) {
   check_run(run, "job_cancel")
-  toft_request("POST", paste0("/api/v1/app/job-runs/", utils::URLencode(run$id, reserved = TRUE), "/cancel"),
+  toft_request("POST", paste0("/api/v1/app/job-runs/", url_escape(run$id), "/cancel"),
                extra_headers = run_headers(run))
   # The cancel answers 204 with no body, so the run is read again: handing
   # back `run` returned it as it was — still "queued" — after it was cancelled.
@@ -661,10 +673,34 @@ run_progress <- function(percent, message = NULL) {
   invisible(NULL)
 }
 
+# The route a run mints its output URL at, at the moment it writes. The URL in
+# TOFT_OUTPUT_URI was signed at bootstrap for at most six hours -- less where
+# the store signs with a role's temporary credential -- so a long run's write at
+# its end found it expired. Asked first; TOFT_OUTPUT_URI is the fallback for a
+# platform that predates the route.
+OUTPUT_URL_PATH <- "/api/v1/runner/output-url"
+
+# fresh_output_url returns a just-minted output URL, or "" when the platform did
+# not give one.
+fresh_output_url <- function() {
+  token <- trimws(Sys.getenv(ENV_JOB_TOKEN, ""))
+  if (!nzchar(token) || !nzchar(trimws(Sys.getenv(ENV_API_URL, "")))) return("")
+  headers <- list()
+  headers[[RUNNER_VERSION_HEADER]] <- RUNNER_CONTRACT_VERSION
+  resp <- tryCatch(
+    toft_request("POST", OUTPUT_URL_PATH, body = list(version = RUNNER_CONTRACT_VERSION),
+                 extra_headers = headers, token = token),
+    error = function(e) NULL)
+  url <- if (is.list(resp)) resp$url else NULL
+  if (is.character(url) && length(url) == 1 && grepl("^https?://", url)) url else ""
+}
+
 #' Write this run's output
 #'
-#' The run's one output, uploaded to the presigned location the platform minted
-#' for it; the app reads it back with \code{job_output()}. For anything large,
+#' The run's one output, uploaded to a presigned location the platform mints
+#' for it at the moment of the write (\code{TOFT_OUTPUT_URI} is the fallback),
+#' so a run of any length can write at its end; the app reads it back with
+#' \code{job_output()}. For anything large,
 #' write it to the app's storage and make the output name it.
 #'
 #' @param data A raw vector or a character string — or, with \code{json = TRUE},
@@ -685,9 +721,14 @@ run_write_output <- function(data, json = FALSE) {
   if (!is.raw(data)) {
     data <- charToRaw(enc2utf8(paste(as.character(data), collapse = "\n")))
   }
+  fresh <- fresh_output_url()
+  if (nzchar(fresh)) uri <- fresh
   handle <- store_handle()
   curl::handle_setopt(handle, customrequest = "PUT", post = TRUE,
                       postfieldsize = length(data), postfields = data)
+  # Azure Blob's Put Blob refuses a request without it; S3 ignores it. Sent on
+  # every output PUT, so the URL alone decides nothing about the backend.
+  curl::handle_setheaders(handle, "x-ms-blob-type" = "BlockBlob")
   resp <- fetch(uri, handle, "uploading this run's output")
   if (resp$status_code >= 400) {
     stop(store_refusal("output_unwritable", sprintf(

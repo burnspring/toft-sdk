@@ -132,28 +132,48 @@ class Mount:
         _check_name_type(name, "upload", optional=True)
         target = name or src.name
         _check_relative_name(target, "upload")
+        # Streamed, never held: hashed in chunks, then sent from the open file
+        # with its length declared — an app under a memory limit could not
+        # otherwise upload a file larger than that limit (security review
+        # 2026-11-14, CS-11). The Go SDK does the same.
         try:
-            data = src.read_bytes()
+            fh = open(src, "rb")  # noqa: SIM115 — closed below, after the send
         except OSError as exc:
             raise local_file_error(src, exc) from None
-        signed = transport().post_json(self._route("/api/v1/app/store/{slug}/objects"), {
-            "name": target, "size": len(data),
-            "sha256": hashlib.sha256(data).hexdigest(),
-            "md5": hashlib.md5(data).hexdigest(),  # noqa: S324 — the store's integrity check
-        })
-        try:
-            _send(signed, data)
-        except ToftError as exc:
-            if exc.status == 412:
-                # `write`, not self.access: the store signs at the mapping's
-                # level *now*, and only `write` is refused an existing name —
-                # the cached level was the one the app started with.
-                raise _refused("already_exists",
-                    f"{target!r} already exists in {self.name!r}, and this app's access "
-                    "there is `write`, which creates new objects only", status=412,
-                    hint="upload under a new name, or ask an administrator for `full` access "
-                         "where the store is mapped") from None
-            raise
+        with fh:
+            try:
+                # The size is what was hashed, so the digests and the declared
+                # length always describe the same bytes.
+                size = 0
+                sha, md5 = hashlib.sha256(), hashlib.md5()  # noqa: S324 — the store's integrity check
+                for chunk in iter(lambda: fh.read(_CHUNK), b""):
+                    sha.update(chunk)
+                    md5.update(chunk)
+                    size += len(chunk)
+                fh.seek(0)
+            except OSError as exc:
+                raise local_file_error(src, exc) from None
+            signed = transport().post_json(self._route("/api/v1/app/store/{slug}/objects"), {
+                "name": target, "size": size,
+                "sha256": sha.hexdigest(),
+                "md5": md5.hexdigest(),
+            })
+            try:
+                _send(signed, _Bounded(fh, size) if size else b"", length=size)
+            except ToftError as exc:
+                # The status the store answers an existing name with is the
+                # signer's to say: 412 where If-None-Match is signed, 403 on an
+                # Azure create-only SAS (code review 2026-11-11, I-5).
+                if exc.status == ((signed or {}).get("exists_status") or 412):
+                    # `write`, not self.access: the store signs at the mapping's
+                    # level *now*, and only `write` is refused an existing name —
+                    # the cached level was the one the app started with.
+                    raise _refused("already_exists",
+                        f"{target!r} already exists in {self.name!r}, and this app's access "
+                        "there is `write`, which creates new objects only", status=412,
+                        hint="upload under a new name, or ask an administrator for `full` access "
+                             "where the store is mapped") from None
+                raise
         return target
 
     def download(self, name: str, dest: "str | Path | None" = None) -> "bytes | Path":
@@ -306,7 +326,27 @@ def _quote_name(name: str) -> str:
     return urllib.parse.quote(name, safe="/")
 
 
-def _send(signed: Any, data: "bytes | None") -> bytes:
+_CHUNK = 1 << 20
+
+
+class _Bounded:
+    """A file read no further than the size that was signed, so a file still
+    being written fails as a short or long body instead of uploading bytes the
+    digests never covered."""
+
+    def __init__(self, fh: Any, size: int) -> None:
+        self._fh, self._left = fh, size
+
+    def read(self, n: int = -1) -> bytes:
+        if self._left <= 0:
+            return b""
+        n = self._left if n is None or n < 0 else min(n, self._left)
+        chunk = self._fh.read(n)
+        self._left -= len(chunk)
+        return chunk
+
+
+def _send(signed: Any, data: Any, length: "int | None" = None) -> bytes:
     """Carry out a signed request against the object store.
 
     No Toft header goes with it: the URL is the whole authorization, and the
@@ -319,6 +359,10 @@ def _send(signed: Any, data: "bytes | None") -> bytes:
                                  method=str(signed.get("method") or "GET"))
     for key, value in (signed.get("headers") or {}).items():
         req.add_header(str(key), str(value))
+    if length is not None:
+        # A declared length, never chunked: the signed PUT carries the size,
+        # and urllib sends a file-like body chunked unless told it.
+        req.add_header("Content-Length", str(length))
     try:
         with urllib.request.urlopen(req, timeout=UPLOAD_TIMEOUT) as resp:
             return resp.read()

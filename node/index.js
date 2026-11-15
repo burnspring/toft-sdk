@@ -188,6 +188,29 @@ async function runnerRequest(baseUrl, token, method, path, body, timeoutMs = DEF
   }
 }
 
+// The route a run mints its output URL at, at the moment it writes. The URL in
+// TOFT_OUTPUT_URI was signed at bootstrap for at most six hours — less where
+// the store signs with a role's temporary credential — so a long run's write
+// at its end found it expired. Asked first; TOFT_OUTPUT_URI is the fallback for
+// a platform that predates the route.
+const OUTPUT_URL_PATH = "/api/v1/runner/output-url";
+
+// Azure Blob's Put Blob refuses a request without it; S3 ignores it. Sent on
+// every output PUT, so the URL alone decides nothing about the backend.
+const OUTPUT_HEADERS = Object.freeze({ "x-ms-blob-type": "BlockBlob" });
+
+/** A just-minted output URL, or "" when the platform did not give one. */
+async function freshOutputUrl(baseUrl, token) {
+  if (!baseUrl || !token) return "";
+  try {
+    const resp = await runnerRequest(baseUrl, token, "POST", OUTPUT_URL_PATH, { version: CONTRACT_VERSION });
+    const url = resp && typeof resp.url === "string" ? resp.url : "";
+    return /^https?:\/\//.test(url) ? url : "";
+  } catch {
+    return "";
+  }
+}
+
 /**
  * The job's own view of itself: who started it, its params, its deadline;
  * report progress, log, write output.
@@ -358,7 +381,9 @@ export class Run {
   }
 
   /**
-   * Upload this run's output. Also a presigned URL, and also in both
+   * Upload this run's output. The URL is minted at the moment of the write, so
+   * a run of any length can write at its end; TOFT_OUTPUT_URI is the fallback.
+   * Also a presigned URL, and also in both
    * execution modes: a filesystem path would work in shared mode and would
    * then make an app written against it unable to move to isolated mode.
    */
@@ -378,7 +403,8 @@ export class Run {
     }
     let resp;
     try {
-      resp = await fetchStore(this.#outputUri, { method: "PUT", body: data });
+      const url = (await freshOutputUrl(this.#baseUrl, this.#token)) || this.#outputUri;
+      resp = await fetchStore(url, { method: "PUT", body: data, headers: { ...OUTPUT_HEADERS } });
     } catch (err) {
       if (err instanceof ToftError) throw err;
       throw new ToftError(`uploading output: ${err.message}`);

@@ -64,7 +64,7 @@ notify <- function(kind, ..., idempotency_key = NULL) {
     if (is.character(body[[f]])) body[[f]] <- as.list(body[[f]])
   }
   invisible(toft_request("POST",
-    paste0("/api/v1/app/notify/", utils::URLencode(kind, reserved = TRUE)),
+    paste0("/api/v1/app/notify/", url_escape(kind)),
     body = body,
     extra_headers = list("Idempotency-Key" = idempotency_key)))
 }
@@ -92,7 +92,7 @@ notify_status <- function(send) {
                       hint = "pass the send_id that notify() returned, or its whole result"))
   }
   raw <- tryCatch(
-    toft_request("GET", paste0("/api/v1/app/sends/", utils::URLencode(as.character(id), reserved = TRUE))),
+    toft_request("GET", paste0("/api/v1/app/sends/", url_escape(as.character(id)))),
     toft_error = function(e) {
       # The platform's not_found names no next step; the id is the caller's.
       if (identical(e$code, "not_found") && (is.null(e$hint) || !nzchar(e$hint))) {
