@@ -3,7 +3,7 @@
  *
  * One import, one entry point:
  *
- *   import toft from "@larchway/toft";
+ *   import toft from "toft-sdk";
  *
  *   toft.app.slug;                          // who am I — plain facts are properties
  *   await toft.app.can("email");            // what did an administrator attach

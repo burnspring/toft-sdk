@@ -1,7 +1,7 @@
 Package: toft
 Title: Toft SDK for R
 Version: 1.2.0
-Authors@R: person("Larchway Labs", role = c("aut", "cre"), email = "noreply@toft.local")
+Authors@R: person("Burnspring", role = c("aut", "cre"), email = "noreply@toft.local")
 Description: The platform's own voice from inside a deployed R app: app data,
     background jobs, integrations, viewer identity and the caller's role. Every
     call needs the environment Toft injects into a deployed app, and says

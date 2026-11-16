@@ -1,5 +1,5 @@
 {
-  "name": "@larchway/toft",
+  "name": "toft-sdk",
   "version": "0.3.0",
   "description": "Toft app SDK — ask what this app may do, resolve its storage by name, and start background work as the app or on a viewer's behalf.",
   "type": "module",

@@ -6,7 +6,7 @@
  * the platform runs it as an isolated workload with a memory limit, a deadline
  * and a durable record.
  *
- *   import toft from "@larchway/toft";
+ *   import toft from "toft-sdk";
  *
  *   // Hono, Next.js route handlers, anything that returns a Fetch Response:
  *   app.post("/reports", async (c) => {
